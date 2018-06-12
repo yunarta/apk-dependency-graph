@@ -1,23 +1,17 @@
 package code;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 import code.io.Arguments;
+
+import java.io.*;
+import java.util.*;
 
 public class SmaliAnalyzer {
 
 	private Arguments arguments;
-	private String filterAsPath;
+
+	private ConfigFile configFile;
+
+	private List<String> projectRoots = new ArrayList<>();
 
 	public SmaliAnalyzer(Arguments arguments) {
 		this.arguments = arguments;
@@ -26,61 +20,92 @@ public class SmaliAnalyzer {
 	private Map<String, Set<String>> dependencies = new HashMap<>();
 
 	public Map<String, Set<String>> getDependencies() {
-		if (arguments.withInnerClasses()) {
-			return dependencies;
-		}
-		return getFilteredDependencies();
+		return dependencies;
 	}
 
-	public boolean run() {
-		String filter = arguments.getFilter();
-		if (filter == null) {
-			System.err.println("Please check your filter!");
-			return false;
+	public boolean run() throws IOException {
+		if (arguments.configFile != null) {
+			configFile = new ConfigFile(arguments.configFile);
+		} else {
+			configFile = new ConfigFile();
+			configFile.packages = Arrays.asList(arguments.filter.split(","));
 		}
 
-		String replacement = Matcher.quoteReplacement(File.separator);
-		String searchString = Pattern.quote(".");
-		filterAsPath = filter.replaceAll(searchString, replacement);
-		File projectFolder = getProjectFolder();
-		if (projectFolder.exists()) {
+		List<File> projectFolder = getProjectFolders(configFile.packages);
+		if (!projectFolder.isEmpty()) {
 			traverseSmaliCode(projectFolder);
 			return true;
-		} else if (isInstantRunEnabled()){
+		} else if (isInstantRunEnabled()) {
 			System.err.println("Enabled Instant Run feature detected. We cannot decompile it. Please, disable Instant Run and rebuild your app.");
 		} else {
-			System.err.println("Smali folder cannot be absent!");
+			System.err.println(arguments.filter == null ? "Smali folder cannot be absent!" : "Please check your filter!");
 		}
 		return false;
 	}
 
-	private File getProjectFolder() {
-		return new File(arguments.getProjectPath());
+	private List<File> getProjectFolders(List<String> packages) {
+		File projectFile = new File(arguments.projectPath);
+
+		String[] projectRoots = {
+				projectFile.getAbsolutePath() + File.separator + "smali",
+				projectFile.getAbsolutePath() + File.separator + "smali_classes2",
+		};
+		this.projectRoots = Arrays.asList(projectRoots);
+
+		List<File> includePaths = new ArrayList<>();
+		if (packages.size() > 0) {
+			for (String projectRoot : projectRoots) {
+
+				for (String packageName : packages) {
+					String includePath = projectRoot;
+					String[] pathElements = packageName.split("\\.");
+					for (String element : pathElements) {
+						includePath += File.separator + element;
+					}
+
+					File file = new File(includePath);
+					if (file.exists()) {
+						includePaths.add(file);
+					}
+				}
+
+			}
+		} else {
+			for (String projectRoot : projectRoots) {
+				File file = new File(projectRoot);
+				if (file.exists()) {
+					includePaths.add(file);
+				}
+			}
+		}
+
+		return includePaths;
 	}
 
 	private boolean isInstantRunEnabled() {
-		File unknownFolder = new File(arguments.getProjectPath() + File.separator + "unknown");
+		File unknownFolder = new File(arguments.projectPath + File.separator + "unknown");
 		if (unknownFolder.exists()) {
 			for (File file : unknownFolder.listFiles()) {
 				if (file.getName().equals("instant-run.zip")) {
 					return true;
 				}
 			}
-			
+
 		}
 		return false;
 	}
-	
-	private void traverseSmaliCode(File folder) {
-		File[] listOfFiles = folder.listFiles();
-		for (int i = 0; i < listOfFiles.length; i++) {
-			File currentFile = listOfFiles[i];
-			if (currentFile.isFile()) {
-				if (currentFile.getName().endsWith(".smali") && currentFile.getAbsolutePath().contains(filterAsPath)) {
-					processSmaliFile(currentFile);
+
+	private void traverseSmaliCode(List<File> folders) {
+		for (File folder : folders) {
+			File[] listOfFiles = folder.listFiles();
+			for (int i = 0; i < listOfFiles.length; i++) {
+				if (listOfFiles[i].isFile()) {
+					if (listOfFiles[i].getName().endsWith(".smali")) {
+						processSmaliFile(listOfFiles[i]);
+					}
+				} else if (listOfFiles[i].isDirectory()) {
+					traverseSmaliCode(Collections.singletonList(listOfFiles[i]));
 				}
-			} else if (currentFile.isDirectory()) {
-				traverseSmaliCode(currentFile);
 			}
 		}
 	}
@@ -89,11 +114,10 @@ public class SmaliAnalyzer {
 		try (BufferedReader br = new BufferedReader(new FileReader(file))) {
 
 			String fileName = file.getName().substring(0, file.getName().lastIndexOf("."));
-			
 			if (CodeUtils.isClassR(fileName)) {
 				return;
 			}
-			
+
 			if (CodeUtils.isClassAnonymous(fileName)) {
 				fileName = CodeUtils.getAnonymousNearestOuter(fileName);
 			}
@@ -104,28 +128,41 @@ public class SmaliAnalyzer {
 			for (String line; (line = br.readLine()) != null;) {
 				try {
 					classNames.clear();
-	
+
 					parseAndAddClassNames(classNames, line);
-	
+
 					// filtering
 					for (String fullClassName : classNames) {
-						if (fullClassName != null && isFilterOk(fullClassName)) {
+						if (fullClassName != null && configFile.isIgnoring(false, fullClassName.replace(File.separator, "."))) {
 							String simpleClassName = getClassSimpleName(fullClassName);
 							if (isClassOk(simpleClassName, fileName)) {
+
 								dependencyNames.add(simpleClassName);
 							}
 						}
 					}
 				} catch (Exception e) {
+					// e.printStackTrace();
 				}
 			}
 
 			// inner/nested class always depends on the outer class
 			if (CodeUtils.isClassInner(fileName)) {
+//				System.out.println("fileName = " + fileName);
 				dependencyNames.add(CodeUtils.getOuterClass(fileName));
 			}
 
 			if (!dependencyNames.isEmpty()) {
+				for (String root : this.projectRoots) {
+					if (file.getAbsolutePath().startsWith(root + File.separatorChar)) {
+						String path = file.getAbsolutePath().replace(File.separatorChar, '.');
+						String className = path.substring(root.length() + 1);
+
+						if (!configFile.isIgnoring(true, className.replace(File.separator, "."))) {
+							return;
+						}
+					}
+				}
 				addDependencies(fileName, dependencyNames);
 			}
 		} catch (FileNotFoundException e) {
@@ -144,7 +181,7 @@ public class SmaliAnalyzer {
 		}
 		return simpleClassName;
 	}
-	
+
 	/**
 	 * The last filter. Do not show anonymous classes (their dependencies belongs to outer class), 
 	 * generated classes, avoid circular dependencies, do not show generated R class
@@ -156,7 +193,7 @@ public class SmaliAnalyzer {
 		return !CodeUtils.isClassAnonymous(simpleClassName) && !CodeUtils.isClassGenerated(simpleClassName)
 				&& !fileName.equals(simpleClassName) && !CodeUtils.isClassR(simpleClassName);
 	}
-	
+
 	private void parseAndAddClassNames(Set<String> classNames, String line) {
 		int index = line.indexOf("L");
 		while (index != -1) {
@@ -198,10 +235,6 @@ public class SmaliAnalyzer {
 		return endIndex;
 	}
 
-	private boolean isFilterOk(String className) {
-		return arguments.getFilter() == null || className.startsWith(arguments.getFilter().replaceAll("\\.", "/"));
-	}
-
 	private void addDependencies(String className, Set<String> dependenciesList) {
 		Set<String> depList = dependencies.get(className);
 		if (depList == null) {
@@ -211,23 +244,5 @@ public class SmaliAnalyzer {
 			// if this class is already added - update its dependencies
 			depList.addAll(dependenciesList);
 		}
-	}
-
-	private Map<String,Set<String>> getFilteredDependencies() {
-		Map<String, Set<String>> filteredDependencies = new HashMap<>();
-		for (String key : dependencies.keySet()) {
-			if (!key.contains("$")) {
-				Set<String> dependencySet = new HashSet<>();
-				for (String dependency : dependencies.get(key)) {
-					if (!dependency.contains("$")) {
-						dependencySet.add(dependency);
-					}
-				}
-				if (dependencySet.size() > 0) {
-					filteredDependencies.put(key, dependencySet);
-				}
-			}
-		}
-		return filteredDependencies;
 	}
 }
